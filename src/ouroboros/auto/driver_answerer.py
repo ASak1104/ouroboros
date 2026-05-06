@@ -155,7 +155,13 @@ def classify_interview_answer_risk(question: str, scaffold: AutoAnswer | None = 
             "destructive or financial/production choice",
         ),
         (
-            r"\b(add|expand|new acceptance|scope|trade[- ]?off|pricing|business|product decision)\b",
+            (
+                r"\b(expand|increase|broaden|change)\s+(the\s+)?scope\b"
+                r"|\bscope\s+(change|expansion|trade[- ]?off)\b"
+                r"|\bnew acceptance\b"
+                r"|\btrade[- ]?off\b"
+                r"|\b(pricing|business|product decision)\b"
+            ),
             "scope or product/business tradeoff",
         ),
         (
@@ -231,16 +237,17 @@ def _ledger_updates_for(
             section,
             LedgerEntry(
                 key=entry.key,
-                value=driver_text,
-                source=LedgerSource.INFERENCE,
+                value=entry.value,
+                source=entry.source,
                 confidence=entry.confidence
                 if entry.status == LedgerStatus.CONFIRMED
                 else min(entry.confidence, 0.72),
                 status=entry.status,
                 reversible=entry.reversible,
                 rationale=(
-                    "Selected-driver answer was sent to the interview; ledger value "
-                    f"mirrors that exact answer. Deterministic scaffold was: {entry.value}"
+                    "Selected-driver answer was sent to the interview; structured ledger "
+                    "state preserves the deterministic scaffold to avoid collapsing "
+                    f"section-specific contracts. Driver answer was: {driver_text}"
                 ),
                 evidence=[*entry.evidence, f"driver:{backend}"],
             ),
@@ -252,11 +259,11 @@ def _ledger_updates_for(
             (
                 "constraints",
                 LedgerEntry(
-                    key=f"constraints.auto_driver_risk.{_slug_key(risk)}",
+                    key=f"risk.auto_driver.{_slug_key(risk)}",
                     value=f"Driver {backend} auto-sent a risky interview answer under brake=off: {risk}",
                     source=LedgerSource.ASSUMPTION,
                     confidence=0.6,
-                    status=LedgerStatus.WEAK,
+                    status=LedgerStatus.INFERRED,
                     rationale="Risk was preserved as provenance for Seed-ready and A-grade review gates.",
                 ),
             )

@@ -3,7 +3,11 @@ from __future__ import annotations
 import pytest
 
 from ouroboros.auto.answerer import AutoAnswerContext, AutoAnswerSource
-from ouroboros.auto.driver_answerer import DriverAutoAnswerer, classify_interview_answer_risk
+from ouroboros.auto.driver_answerer import (
+    DriverAutoAnswerer,
+    _ledger_updates_for,
+    classify_interview_answer_risk,
+)
 from ouroboros.auto.ledger import LedgerStatus, SeedDraftLedger
 from ouroboros.auto.state import AutoBrakeMode
 from ouroboros.core.types import Result
@@ -34,6 +38,13 @@ def test_classifies_blocker_questions_as_risky() -> None:
     assert classify_interview_answer_risk("Which production credentials should we use?", scaffold)
 
 
+def test_classifies_routine_non_goal_gap_as_not_risky() -> None:
+    assert (
+        classify_interview_answer_risk("What non-goals should explicitly remain out of scope?")
+        is None
+    )
+
+
 @pytest.mark.asyncio
 async def test_driver_answerer_brake_off_answers_risky_question() -> None:
     ledger = SeedDraftLedger.from_goal("Deploy a service")
@@ -53,7 +64,7 @@ async def test_driver_answerer_brake_off_answers_risky_question() -> None:
 
 
 @pytest.mark.asyncio
-async def test_driver_answerer_ledger_updates_mirror_driver_answer() -> None:
+async def test_driver_answerer_preserves_scaffold_ledger_values() -> None:
     ledger = SeedDraftLedger.from_goal("Build a CLI")
     adapter = FakeAdapter("Use Typer and verify with pytest.")
     answerer = DriverAutoAnswerer(backend="codex", brake=AutoBrakeMode.OFF, adapter=adapter)
@@ -61,9 +72,43 @@ async def test_driver_answerer_ledger_updates_mirror_driver_answer() -> None:
     answer = await answerer.answer("Which runtime and framework should be used?", ledger)
 
     assert answer.ledger_updates
-    assert all(entry.value == answer.text for _section, entry in answer.ledger_updates)
-    assert {entry.source.value for _section, entry in answer.ledger_updates} == {"inference"}
+    assert all(entry.value != answer.text for _section, entry in answer.ledger_updates)
+    assert {entry.source for _section, entry in answer.ledger_updates}
     assert any("driver:codex" in entry.evidence for _section, entry in answer.ledger_updates)
+    assert any("Driver answer was:" in entry.rationale for _section, entry in answer.ledger_updates)
+
+
+@pytest.mark.asyncio
+async def test_driver_answerer_preserves_scaffold_provenance() -> None:
+    from ouroboros.auto.answerer import AutoAnswer, AutoAnswerSource
+    from ouroboros.auto.ledger import LedgerEntry, LedgerSource, LedgerStatus
+
+    scaffold = AutoAnswer(
+        text="Assume no external services.",
+        source=AutoAnswerSource.CONSERVATIVE_DEFAULT,
+        confidence=0.8,
+        ledger_updates=[
+            (
+                "non_goals",
+                LedgerEntry(
+                    key="non_goals.auto_mvp",
+                    value="External services are out of scope.",
+                    source=LedgerSource.NON_GOAL,
+                    confidence=0.8,
+                    status=LedgerStatus.DEFAULTED,
+                ),
+            )
+        ],
+    )
+
+    updates = _ledger_updates_for(
+        scaffold,
+        driver_text="[driver=codex] Keep the MVP local.",
+        risk=None,
+        backend="codex",
+    )
+
+    assert updates[0][1].source == LedgerSource.NON_GOAL
 
 
 @pytest.mark.asyncio
@@ -104,6 +149,26 @@ async def test_driver_answerer_constructs_adapter_with_session_cwd(monkeypatch, 
 
     assert answer.source == AutoAnswerSource.DRIVER
     assert captured["cwd"] == tmp_path
+
+
+@pytest.mark.asyncio
+async def test_driver_answerer_risky_brake_off_records_active_risk() -> None:
+    from ouroboros.auto.ledger import LedgerSource, LedgerStatus
+
+    ledger = SeedDraftLedger.from_goal("Deploy a service")
+    adapter = FakeAdapter("Use a placeholder secret reference, never a real credential.")
+    answerer = DriverAutoAnswerer(backend="codex", brake=AutoBrakeMode.OFF, adapter=adapter)
+
+    answer = await answerer.answer("Which production credentials should we use?", ledger)
+
+    risks = [
+        entry
+        for _section, entry in answer.ledger_updates
+        if entry.key.startswith("risk.auto_driver")
+    ]
+    assert risks
+    assert risks[0].source == LedgerSource.ASSUMPTION
+    assert risks[0].status == LedgerStatus.INFERRED
 
 
 @pytest.mark.asyncio
