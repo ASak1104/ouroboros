@@ -30,6 +30,11 @@ class FakeAdapter:
         )
 
 
+class RaisingAdapter:
+    async def complete(self, messages, config):  # noqa: ANN001, ARG002
+        raise RuntimeError("backend crashed")
+
+
 def test_classifies_blocker_questions_as_risky() -> None:
     ledger = SeedDraftLedger.from_goal("Deploy a service")
     answerer = DriverAutoAnswerer(backend="codex", brake=AutoBrakeMode.OFF, adapter=FakeAdapter())
@@ -149,6 +154,42 @@ async def test_driver_answerer_constructs_adapter_with_session_cwd(monkeypatch, 
 
     assert answer.source == AutoAnswerSource.DRIVER
     assert captured["cwd"] == tmp_path
+
+
+@pytest.mark.asyncio
+async def test_driver_answerer_adapter_creation_exception_becomes_blocker(monkeypatch) -> None:
+    from ouroboros.auto import driver_answerer as module
+
+    def fake_create_llm_adapter(**kwargs):  # noqa: ANN003, ANN202, ARG001
+        raise FileNotFoundError("codex missing")
+
+    monkeypatch.setattr(module, "create_llm_adapter", fake_create_llm_adapter)
+    ledger = SeedDraftLedger.from_goal("Build a CLI")
+    answerer = DriverAutoAnswerer(backend="codex", brake=AutoBrakeMode.OFF)
+
+    answer = await answerer.answer("Which runtime should be used?", ledger)
+
+    assert answer.source == AutoAnswerSource.BLOCKER
+    assert answer.blocker is not None
+    assert "selected driver codex failed to answer" in answer.blocker.reason
+    assert "FileNotFoundError" in answer.blocker.reason
+
+
+@pytest.mark.asyncio
+async def test_driver_answerer_complete_exception_becomes_blocker() -> None:
+    ledger = SeedDraftLedger.from_goal("Build a CLI")
+    answerer = DriverAutoAnswerer(
+        backend="codex",
+        brake=AutoBrakeMode.OFF,
+        adapter=RaisingAdapter(),  # type: ignore[arg-type]
+    )
+
+    answer = await answerer.answer("Which runtime should be used?", ledger)
+
+    assert answer.source == AutoAnswerSource.BLOCKER
+    assert answer.blocker is not None
+    assert "selected driver codex failed to answer" in answer.blocker.reason
+    assert "RuntimeError" in answer.blocker.reason
 
 
 @pytest.mark.asyncio

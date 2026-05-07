@@ -66,40 +66,50 @@ class DriverAutoAnswerer:
                 source=AutoAnswerSource.BLOCKER,
                 confidence=1.0,
                 blocker=AutoBlocker(reason=reason, question=question),
-            )
+        )
 
         if self.adapter is None:
-            self.adapter = create_llm_adapter(
-                backend=self.backend,
-                use_case="interview",
-                cwd=self.cwd,
-                allowed_tools=[],
-                max_turns=1,
-                timeout=self.timeout_seconds,
-            )
+            try:
+                self.adapter = create_llm_adapter(
+                    backend=self.backend,
+                    use_case="interview",
+                    cwd=self.cwd,
+                    allowed_tools=[],
+                    max_turns=1,
+                    timeout=self.timeout_seconds,
+                )
+            except Exception as exc:
+                return _driver_failure_answer(
+                    backend=self.backend,
+                    question=question,
+                    failure=f"{type(exc).__name__}: {exc}",
+                )
         assert self.adapter is not None
         prompt = _driver_prompt(
             question, ledger, scaffold, backend=self.backend or "driver", risk=risk
         )
-        result = await self.adapter.complete(
-            messages=[Message(role=MessageRole.USER, content=prompt)],
-            config=CompletionConfig(
-                model="default",
-                temperature=0.2,
-                max_tokens=700,
-                role="auto_interview_answer",
-                max_turns=1,
-            ),
-        )
-        if not result.is_ok:
-            return AutoAnswer(
-                text=f"Cannot obtain driver answer: {result.error}",
-                source=AutoAnswerSource.BLOCKER,
-                confidence=1.0,
-                blocker=AutoBlocker(
-                    reason=f"selected driver {self.backend} failed to answer: {result.error}",
-                    question=question,
+        try:
+            result = await self.adapter.complete(
+                messages=[Message(role=MessageRole.USER, content=prompt)],
+                config=CompletionConfig(
+                    model="default",
+                    temperature=0.2,
+                    max_tokens=700,
+                    role="auto_interview_answer",
+                    max_turns=1,
                 ),
+            )
+        except Exception as exc:
+            return _driver_failure_answer(
+                backend=self.backend,
+                question=question,
+                failure=f"{type(exc).__name__}: {exc}",
+            )
+        if not result.is_ok:
+            return _driver_failure_answer(
+                backend=self.backend,
+                question=question,
+                failure=str(result.error),
             )
         text = _clean_driver_text(result.value.content)
         if not text:
@@ -138,6 +148,19 @@ class DriverAutoAnswerer:
     def apply(self, answer: AutoAnswer, ledger: SeedDraftLedger, *, question: str) -> None:
         """Apply a selected-driver answer to the ledger."""
         self.baseline.apply(answer, ledger, question=question)
+
+
+def _driver_failure_answer(*, backend: str | None, question: str, failure: str) -> AutoAnswer:
+    """Convert selected-driver backend failures into recoverable interview blockers."""
+    return AutoAnswer(
+        text=f"Cannot obtain driver answer: {failure}",
+        source=AutoAnswerSource.BLOCKER,
+        confidence=1.0,
+        blocker=AutoBlocker(
+            reason=f"selected driver {backend} failed to answer: {failure}",
+            question=question,
+        ),
+    )
 
 
 def classify_interview_answer_risk(question: str, scaffold: AutoAnswer | None = None) -> str | None:
