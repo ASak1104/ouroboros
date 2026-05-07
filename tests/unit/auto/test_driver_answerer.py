@@ -69,7 +69,7 @@ async def test_driver_answerer_brake_off_answers_risky_question() -> None:
 
 
 @pytest.mark.asyncio
-async def test_driver_answerer_preserves_scaffold_ledger_values() -> None:
+async def test_driver_answerer_records_driver_text_for_unsupported_scaffold_values() -> None:
     ledger = SeedDraftLedger.from_goal("Build a CLI")
     adapter = FakeAdapter("Use Typer and verify with pytest.")
     answerer = DriverAutoAnswerer(backend="codex", brake=AutoBrakeMode.OFF, adapter=adapter)
@@ -77,10 +77,10 @@ async def test_driver_answerer_preserves_scaffold_ledger_values() -> None:
     answer = await answerer.answer("Which runtime and framework should be used?", ledger)
 
     assert answer.ledger_updates
-    assert all(entry.value != answer.text for _section, entry in answer.ledger_updates)
     assert {entry.source for _section, entry in answer.ledger_updates}
     assert any("driver:codex" in entry.evidence for _section, entry in answer.ledger_updates)
-    assert any("Driver answer was:" in entry.rationale for _section, entry in answer.ledger_updates)
+    assert any(entry.value == answer.text for _section, entry in answer.ledger_updates)
+    assert any("Scaffold was:" in entry.rationale for _section, entry in answer.ledger_updates)
 
 
 @pytest.mark.asyncio
@@ -133,6 +133,29 @@ async def test_driver_answerer_preserves_confirmed_scaffold_status() -> None:
     ]
     assert runtime_updates
     assert any(entry.status is LedgerStatus.CONFIRMED for entry in runtime_updates)
+
+
+@pytest.mark.asyncio
+async def test_driver_answerer_keeps_unsupported_scaffold_contract_open() -> None:
+    ledger = SeedDraftLedger.from_goal("Build a CLI")
+    context = AutoAnswerContext(
+        repo_facts={"runtime_context": "Python package managed by uv"},
+        evidence={"runtime_context": ["pyproject.toml"]},
+    )
+    adapter = FakeAdapter("Use Rust and Cargo for the implementation.")
+    answerer = DriverAutoAnswerer(backend="codex", brake=AutoBrakeMode.OFF, adapter=adapter)
+
+    answer = await answerer.answer("Which runtime and framework should be used?", ledger, context)
+
+    runtime_updates = [
+        entry for section, entry in answer.ledger_updates if section == "runtime_context"
+    ]
+    assert runtime_updates
+    assert all(entry.status is LedgerStatus.WEAK for entry in runtime_updates)
+    assert any("Use Rust and Cargo" in entry.value for entry in runtime_updates)
+    assert any(
+        "Scaffold was: Python package managed by uv" in entry.rationale for entry in runtime_updates
+    )
 
 
 @pytest.mark.asyncio

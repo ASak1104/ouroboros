@@ -256,25 +256,7 @@ def _ledger_updates_for(
     scaffold: AutoAnswer, *, driver_text: str, risk: str | None, backend: str
 ) -> list[tuple[str, LedgerEntry]]:
     updates = [
-        (
-            section,
-            LedgerEntry(
-                key=entry.key,
-                value=entry.value,
-                source=entry.source,
-                confidence=entry.confidence
-                if entry.status == LedgerStatus.CONFIRMED
-                else min(entry.confidence, 0.72),
-                status=entry.status,
-                reversible=entry.reversible,
-                rationale=(
-                    "Selected-driver answer was sent to the interview; structured ledger "
-                    "state preserves the deterministic scaffold to avoid collapsing "
-                    f"section-specific contracts. Driver answer was: {driver_text}"
-                ),
-                evidence=[*entry.evidence, f"driver:{backend}"],
-            ),
-        )
+        _driver_backed_entry(section, entry, driver_text=driver_text, backend=backend)
         for section, entry in scaffold.ledger_updates
     ]
     if risk:
@@ -292,6 +274,74 @@ def _ledger_updates_for(
             )
         )
     return updates
+
+
+def _driver_backed_entry(
+    section: str, entry: LedgerEntry, *, driver_text: str, backend: str
+) -> tuple[str, LedgerEntry]:
+    supported = _driver_text_supports_entry(driver_text, entry.value)
+    status = entry.status if supported else LedgerStatus.WEAK
+    value = entry.value if supported else driver_text
+    confidence = (
+        entry.confidence
+        if supported and entry.status == LedgerStatus.CONFIRMED
+        else min(entry.confidence, 0.72)
+    )
+    rationale = (
+        "Selected-driver answer was sent to the interview and supports this "
+        f"structured scaffold entry. Driver answer was: {driver_text}"
+        if supported
+        else (
+            "Selected-driver answer was sent to the interview, but it did not "
+            "explicitly support this deterministic scaffold entry; keep the "
+            "section open instead of resolving the ledger against a different "
+            f"contract. Scaffold was: {entry.value}"
+        )
+    )
+    return (
+        section,
+        LedgerEntry(
+            key=entry.key,
+            value=value,
+            source=entry.source,
+            confidence=confidence,
+            status=status,
+            reversible=entry.reversible,
+            rationale=rationale,
+            evidence=[*entry.evidence, f"driver:{backend}"],
+        ),
+    )
+
+
+_SUPPORT_STOPWORDS = frozenset(
+    {
+        "and",
+        "are",
+        "for",
+        "the",
+        "use",
+        "with",
+        "should",
+        "existing",
+    }
+)
+
+
+def _driver_text_supports_entry(driver_text: str, scaffold_value: str) -> bool:
+    """Return True when the driver answer visibly supports a scaffold value."""
+    scaffold_tokens = _support_tokens(scaffold_value)
+    if not scaffold_tokens:
+        return False
+    driver_tokens = _support_tokens(driver_text)
+    return bool(scaffold_tokens & driver_tokens)
+
+
+def _support_tokens(value: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", value.lower())
+        if token not in _SUPPORT_STOPWORDS and len(token) >= 2
+    }
 
 
 def _slug_key(value: str) -> str:
