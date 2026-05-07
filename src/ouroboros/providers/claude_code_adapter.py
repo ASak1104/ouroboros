@@ -670,11 +670,22 @@ class ClaudeCodeAdapter:
             # ``ClaudeAgentOptions`` does not expose ``strict_mcp_config``
             # as a typed field across the supported SDK pin range
             # (``claude-agent-sdk>=0.1.0,<1.0.0``); current releases accept
-            # the flag only via ``extra_args`` (CLI passthrough).  When a
-            # caller asked for strict isolation we MUST honor it — silently
-            # degrading would re-open the recursion path the caller is
-            # trying to close.  Raise a clear, actionable upgrade error
-            # instead of best-effort no-op.
+            # the flag only via ``extra_args`` (CLI passthrough).
+            #
+            # Compatibility invariant (verified against the published
+            # PyPI history): ``extra_args`` has been a field on
+            # ``ClaudeAgentOptions`` since the earliest published release
+            # (``claude-agent-sdk==0.0.23``) and remains present at every
+            # version in the declared support range, so the
+            # ``extra_args`` branch below is the path actually taken on
+            # any pip-installed SDK in that range.  The fail-fast branch
+            # is defense-in-depth against vendored, partial, or
+            # monkey-patched SDK builds where the field has been removed:
+            # we MUST honor the caller's isolation request rather than
+            # silently re-open the recursion path.  ``test_factory.py``
+            # and ``test_claude_code_adapter.py`` lock the live-SDK
+            # invariant so any future upper-bound bump that drops
+            # ``extra_args`` fails CI before reaching production.
             field_names = _claude_options_field_names()
             if "strict_mcp_config" in field_names:
                 options_kwargs["strict_mcp_config"] = True

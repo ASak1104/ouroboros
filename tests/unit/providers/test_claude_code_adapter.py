@@ -695,6 +695,37 @@ class TestJsonSchemaHandling:
         assert "strict_mcp_config" not in options_call_kwargs
         assert "strict-mcp-config" not in (options_call_kwargs.get("extra_args") or {})
 
+    def test_live_claude_agent_sdk_supports_extra_args(self) -> None:
+        """Pin invariant: every ``claude-agent-sdk`` version in the declared
+        support range (``>=0.1.0,<1.0.0``) MUST expose ``extra_args``.
+
+        Verified empirically against the published PyPI history
+        (``extra_args`` is a field on ``ClaudeAgentOptions`` since the
+        earliest public release ``0.0.23``).  This test locks the
+        invariant in CI so a future upper-bound bump or vendored SDK
+        swap that drops the field fails fast at test time, well before
+        the adapter's defense-in-depth fail-fast path could fire in
+        production.
+        """
+        from ouroboros.providers.claude_code_adapter import (
+            _claude_options_field_names,
+        )
+
+        # ``_claude_options_field_names`` is ``lru_cache``-d, so clear it
+        # to make this test independent of any monkeypatching done
+        # elsewhere in the module.
+        _claude_options_field_names.cache_clear()
+        try:
+            field_names = _claude_options_field_names()
+        finally:
+            _claude_options_field_names.cache_clear()
+        assert "extra_args" in field_names, (
+            "claude-agent-sdk lost the ``extra_args`` passthrough field; the "
+            "interview recursion fix relies on it. Either pin the SDK to a "
+            "release that still has it or add a typed ``strict_mcp_config`` "
+            "kwarg to the adapter forwarding."
+        )
+
     @pytest.mark.asyncio
     async def test_strict_mcp_config_uses_extra_args_when_options_supports_it(
         self, monkeypatch: pytest.MonkeyPatch
