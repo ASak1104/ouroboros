@@ -601,10 +601,9 @@ class ClaudeCodeAdapter:
             "CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK": os.environ.get(
                 "OUROBOROS_SKIP_VERSION_CHECK", "1"
             ),
-            "CLAUDECODE": "",
-            "CLAUDE_PLUGIN_DATA": "",
-            "CLAUDE_PLUGIN_ROOT": "",
         }
+        if claudecode_present:
+            env_overrides["CLAUDECODE"] = ""
 
         stderr_lines: list[str] = []
 
@@ -629,6 +628,11 @@ class ClaudeCodeAdapter:
             # default built-ins like AskUserQuestion/ToolSearch.
             options_kwargs["allowed_tools"] = list(self._allowed_tools)
             options_kwargs["tools"] = list(self._allowed_tools)
+            # When the caller pinned an explicit read-only envelope, also
+            # ignore plugin-provided MCP servers so the subprocess cannot
+            # reach mcp__plugin_* tools (notably ouroboros itself, which
+            # would recurse on ouroboros_interview).
+            options_kwargs["strict_mcp_config"] = True
 
         # Pass model from CompletionConfig if specified
         # "default" is not a valid SDK model — treat it as None (use SDK default)
