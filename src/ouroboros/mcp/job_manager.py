@@ -556,6 +556,65 @@ class JobManager:
 
         return await self.get_snapshot(job_id)
 
+    async def find_active_job_by_lineage(
+        self,
+        lineage_id: str,
+        *,
+        job_type: str | None = None,
+        include_terminal: bool = False,
+    ) -> JobSnapshot | None:
+        """Return the most recently updated job for ``lineage_id``.
+
+        Used by the auto pipeline RALPH_HANDOFF resume path to rediscover an
+        already-running Ralph job when the auto state recorded a lineage_id
+        but crashed (or returned to caller) before the job_id was persisted.
+        Without this lookup, resuming an in-flight handoff would dispatch a
+        second Ralph loop for the same lineage. By default, returns ``None``
+        when no active match exists; terminal jobs are deliberately ignored for
+        legacy callers. Set ``include_terminal=True`` for crash-gap recovery
+        paths that must consume the already-finished job result instead of
+        starting duplicate lineage work.
+        """
+        await self._ensure_initialized()
+        candidates: list[JobSnapshot] = []
+        candidate_job_ids = set(self._known_job_ids)
+        offset = 0
+        while True:
+            created_events = await self._event_store.query_events(
+                event_type="mcp.job.created",
+                limit=100,
+                offset=offset,
+            )
+            if not created_events:
+                break
+            for event in created_events:
+                links = event.data.get("links") or {}
+                if links.get("lineage_id") != lineage_id:
+                    continue
+                if job_type is not None and event.data.get("job_type") != job_type:
+                    continue
+                candidate_job_ids.add(event.aggregate_id)
+            if len(created_events) < 100:
+                break
+            offset += 100
+
+        for job_id in candidate_job_ids:
+            try:
+                snapshot = await self.get_snapshot(job_id)
+            except ValueError:
+                continue
+            if snapshot.is_terminal and not include_terminal:
+                continue
+            if snapshot.links.lineage_id != lineage_id:
+                continue
+            if job_type is not None and snapshot.job_type != job_type:
+                continue
+            self._known_job_ids.add(job_id)
+            candidates.append(snapshot)
+        if not candidates:
+            return None
+        return max(candidates, key=lambda s: s.updated_at)
+
     async def cleanup_expired_jobs(self, ttl: timedelta | None = None) -> int:
         """Remove terminal jobs older than *ttl* from the in-memory registry.
 

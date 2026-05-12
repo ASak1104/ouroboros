@@ -43,9 +43,13 @@ from ouroboros.ralph_loop import (
 MAX_RALPH_GENERATIONS = 10
 MIN_PER_ITERATION_TIMEOUT_SECONDS = 30.0
 MAX_PER_ITERATION_TIMEOUT_SECONDS = 7200.0
+MIN_MAX_TOTAL_SECONDS = 1.0
+MAX_MAX_TOTAL_SECONDS = 86400.0
 MIN_PROGRESS_WINDOW = 2  # smallest window where strict-decrease / repeat checks are meaningful
 MIN_MAX_TOTAL_SECONDS = 1.0
 MAX_MAX_TOTAL_SECONDS = 86400.0
+
+logger = logging.getLogger(__name__)
 
 logger = logging.getLogger(__name__)
 
@@ -360,9 +364,9 @@ class RalphHandler:
             project_dir=arguments.get("project_dir"),
             max_generations=max_generations,
             per_iteration_timeout_seconds=per_iteration_timeout_seconds,
+            max_total_seconds=max_total_seconds,
             oscillation_window=oscillation_window,
             grade_regression_window=grade_regression_window,
-            max_total_seconds=max_total_seconds,
         )
 
         if should_dispatch_via_plugin(self.agent_runtime_backend, self.opencode_mode):
@@ -381,9 +385,9 @@ class RalphHandler:
                 project_dir=config.project_dir,
                 max_generations=config.max_generations,
                 per_iteration_timeout_seconds=config.per_iteration_timeout_seconds,
+                max_total_seconds=config.max_total_seconds,
                 oscillation_window=config.oscillation_window,
                 grade_regression_window=config.grade_regression_window,
-                max_total_seconds=config.max_total_seconds,
             )
             await self._event_store.initialize()
             await emit_subagent_dispatched_event(
