@@ -177,6 +177,31 @@ _TEST_WORK_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
+_TEST_MUTATION_WORK_RE = re.compile(
+    r"("
+    r"\b(?:add|write|create|implement|fix|update|extend|expand)\b.{0,60}\b"
+    r"(?:tests?|unit\s+tests?|integration\s+tests?|coverage|test_[\w.-]+\.py)\b"
+    r"|"
+    r"\b(?:tests?|unit\s+tests?|integration\s+tests?|test_[\w.-]+\.py)\b.{0,60}\b"
+    r"(?:cover|coverage)\b"
+    r"|"
+    r"\bcheck(?:ed)?\s+(?:tests?|unit\s+tests?|integration\s+tests?|test_[\w.-]+\.py)"
+    r"\s+into\b"
+    r"|"
+    r"\bcheck\s+in\b.{0,60}\b"
+    r"(?:tests?|unit\s+tests?|integration\s+tests?|test_[\w.-]+\.py)\b"
+    r")",
+    re.IGNORECASE,
+)
+_VALIDATION_ONLY_ACTION_RE = re.compile(
+    r"\b(?:run|execute|pass|validate|verify|ensure|confirm|check)\b",
+    re.IGNORECASE,
+)
+_VALIDATION_ONLY_TEST_SIGNAL_RE = re.compile(
+    r"\b(?:pytest|unit\s+tests?|integration\s+tests?|tests?|test suite|"
+    r"test_[\w.-]+\.py|python\s+-m\s+unittest)\b",
+    re.IGNORECASE,
+)
 
 
 def _has_mixed_code_and_documentation_work(ac_content: str) -> bool:
@@ -236,12 +261,44 @@ def _is_documentation_only_ac(ac_content: str) -> bool:
     )
 
 
+def _is_validation_only_ac(ac_content: str) -> bool:
+    """Return True when an AC asks only to run or verify tests.
+
+    Test-writing ACs still require ``files_touched``; validation-only ACs are
+    allowed to prove completion with command/test evidence and no file mutation.
+    """
+    normalized = " ".join(ac_content.split())
+    if not normalized:
+        return False
+    if _is_documentation_only_ac(normalized):
+        return False
+    if _DOC_ONLY_TARGET_RE.search(normalized) and _DOC_ONLY_ACTION_RE.search(normalized):
+        return False
+    if _TEST_MUTATION_WORK_RE.search(normalized):
+        return False
+    if _CODE_MUTATION_ACTION_RE.search(normalized) and _CODE_WORK_SIGNAL_RE.search(normalized):
+        return False
+    if _CODE_IMPLEMENTATION_ACTION_RE.search(normalized):
+        return False
+    if _has_mixed_code_and_documentation_work(normalized):
+        return False
+    return bool(_VALIDATION_ONLY_ACTION_RE.search(normalized)) and bool(
+        _VALIDATION_ONLY_TEST_SIGNAL_RE.search(normalized)
+    )
+
+
 def _effective_evidence_schema_for_ac(
     profile: ExecutionProfile,
     ac_content: str,
 ) -> EvidenceSchema:
     """Return the active evidence schema for one atomic AC dispatch."""
     schema = profile.evidence_schema
+    if _is_validation_only_ac(ac_content) and "files_touched" in schema.required:
+        required = tuple(field for field in schema.required if field != "files_touched")
+        rejected_if = tuple(
+            expr for expr in schema.rejected_if if not expr.strip().startswith("files_touched")
+        )
+        return EvidenceSchema(required=required, rejected_if=rejected_if)
     if not _is_documentation_only_ac(ac_content) or "tests_passed" not in schema.required:
         return schema
     required = tuple(field for field in schema.required if field != "tests_passed")
@@ -266,6 +323,18 @@ def _out_of_scope_evidence_fields_for_ac(
         for field in profile.evidence_schema.required
         if field not in required_fields and _flatten_evidence_values(record.get(field))
     )
+
+
+def _out_of_scope_evidence_values_for_ac(
+    profile: ExecutionProfile,
+    ac_content: str,
+    record: EvidenceRecord | None,
+) -> dict[str, Any]:
+    """Return out-of-scope evidence values retained for audit metadata only."""
+    if record is None:
+        return {}
+    fields = _out_of_scope_evidence_fields_for_ac(profile, ac_content, record)
+    return {field: record.data[field] for field in fields if field in record.data}
 
 
 def _scoped_evidence_record_for_ac(
@@ -4320,6 +4389,15 @@ Respond with either "ATOMIC" or the JSON array only, nothing else.
                     "in commands_run when it directly validates the current docs change; "
                     "do not list individual test names or prior test IDs.\n"
                 )
+            validation_only_note = ""
+            if _is_validation_only_ac(ac_content):
+                validation_only_note = (
+                    "This is a validation-only current AC: prove it with commands_run "
+                    "and tests_passed from this runtime session. Do not include "
+                    "files_touched unless you actually edited, wrote, or generated files "
+                    "for this current AC. Read-only inspection or running tests does not "
+                    "count as files_touched.\n"
+                )
             completion_instruction = (
                 "## Current AC Scope Contract\n"
                 "You are responsible only for the current acceptance criterion in "
@@ -4336,7 +4414,7 @@ Respond with either "ATOMIC" or the JSON array only, nothing else.
                 "as test, build, lint, generation, or docs verification commands; omit "
                 "exploratory discovery commands such as rg, grep, sed, cat, ls, find, "
                 "or pwd unless the current AC explicitly requires that command as validation.\n"
-                f"{doc_only_note}\n"
+                f"{doc_only_note}{validation_only_note}\n"
                 "Use the available tools to accomplish this task. Report progress through "
                 "tool-visible work, not a prose-only completion claim.\n"
                 "When complete, emit exactly ONE fenced JSON evidence record as the "
@@ -5065,6 +5143,11 @@ Files present:
                     ac_content,
                     typed_evidence,
                 )
+            )
+            data["ignored_out_of_scope_evidence"] = _out_of_scope_evidence_values_for_ac(
+                self._execution_profile,
+                ac_content,
+                typed_evidence,
             )
         if typed_validation is not None:
             data["missing_fields"] = list(typed_validation.missing_fields)
