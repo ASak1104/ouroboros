@@ -200,6 +200,390 @@ class TestJobManager:
             await _cancel_manager_tasks(manager)
             await store.close()
 
+    async def test_monitor_fails_job_when_deliver_progress_stays_zero_after_ac_success(
+        self, tmp_path
+    ) -> None:
+        store = _build_store(tmp_path)
+        manager = JobManager(store)
+
+        try:
+            stop = asyncio.Event()
+
+            async def _runner() -> MCPToolResult:
+                await stop.wait()
+                return MCPToolResult(
+                    content=(MCPContentItem(type=ContentType.TEXT, text="late done"),),
+                    is_error=False,
+                )
+
+            started = await manager.start_job(
+                job_type="execute_seed",
+                initial_message="queued",
+                runner=_runner(),
+                links=JobLinks(session_id="orch_stalled", execution_id="exec_stalled"),
+            )
+
+            original_append_event = manager._append_event
+
+            async def _assert_failure_persists_before_teardown(
+                event_type: str, job_id: str, data: dict, **kwargs
+            ) -> None:
+                if event_type == "mcp.job.failed":
+                    runner_task = manager._runner_tasks[job_id]
+                    job_task = manager._tasks[job_id]
+                    assert not runner_task.cancelled()
+                    assert not job_task.cancelled()
+                await original_append_event(event_type, job_id, data, **kwargs)
+
+            manager._append_event = _assert_failure_persists_before_teardown
+
+            await store.append(
+                BaseEvent(
+                    type="workflow.progress.updated",
+                    aggregate_type="execution",
+                    aggregate_id="exec_stalled",
+                    data={
+                        "completed_count": 0,
+                        "total_count": 23,
+                        "current_phase": "Deliver",
+                    },
+                )
+            )
+            await store.append(
+                BaseEvent(
+                    type="execution.session.completed",
+                    aggregate_type="execution",
+                    aggregate_id="exec_stalled_ac_1",
+                    data={
+                        "execution_id": "exec_stalled",
+                        "session_id": "child_1",
+                        "session_scope_id": "exec_stalled_ac_1",
+                        "success": True,
+                    },
+                )
+            )
+            await store.append(
+                BaseEvent(
+                    type="execution.terminal",
+                    aggregate_type="execution",
+                    aggregate_id="exec_stalled",
+                    data={"session_id": "orch_stalled", "status": "failed"},
+                )
+            )
+
+            snapshot = await _wait_for_job_status(
+                manager, started.job_id, JobStatus.FAILED, timeout=2.0
+            )
+
+            assert "workflow progress accounting stalled" in (snapshot.error or "")
+            assert snapshot.result_meta["failed_from_progress_accounting_stall"] is True
+        finally:
+            stop.set()
+            await _cancel_manager_tasks(manager)
+            await store.close()
+
+    async def test_progress_accounting_append_failure_retries_terminalization(
+        self, tmp_path
+    ) -> None:
+        store = _build_store(tmp_path)
+        manager = JobManager(store)
+
+        try:
+            stop = asyncio.Event()
+
+            async def _runner() -> MCPToolResult:
+                await stop.wait()
+                return MCPToolResult(
+                    content=(MCPContentItem(type=ContentType.TEXT, text="late done"),),
+                    is_error=False,
+                )
+
+            started = await manager.start_job(
+                job_type="execute_seed",
+                initial_message="queued",
+                runner=_runner(),
+                links=JobLinks(session_id="orch_append_fail", execution_id="exec_append_fail"),
+            )
+
+            original_append_event = manager._append_event
+            failed_attempts = 0
+
+            async def _fail_first_terminal_failure_append(
+                event_type: str, job_id: str, data: dict, **kwargs
+            ) -> None:
+                nonlocal failed_attempts
+                if event_type == "mcp.job.failed" and failed_attempts == 0:
+                    failed_attempts += 1
+                    raise PersistenceError("synthetic append failure", operation="insert")
+                await original_append_event(event_type, job_id, data, **kwargs)
+
+            manager._append_event = _fail_first_terminal_failure_append
+
+            await store.append(
+                BaseEvent(
+                    type="workflow.progress.updated",
+                    aggregate_type="execution",
+                    aggregate_id="exec_append_fail",
+                    data={
+                        "session_id": "orch_append_fail",
+                        "completed_count": 0,
+                        "total_count": 1,
+                        "current_phase": "Deliver",
+                    },
+                )
+            )
+            await store.append(
+                BaseEvent(
+                    type="execution.session.completed",
+                    aggregate_type="execution",
+                    aggregate_id="exec_append_fail_ac_1",
+                    data={
+                        "execution_id": "exec_append_fail",
+                        "session_id": "child_1",
+                        "session_scope_id": "exec_append_fail_ac_1",
+                        "success": True,
+                    },
+                )
+            )
+            await store.append(
+                BaseEvent(
+                    type="execution.terminal",
+                    aggregate_type="execution",
+                    aggregate_id="exec_append_fail",
+                    data={"session_id": "orch_append_fail", "status": "failed"},
+                )
+            )
+
+            snapshot = await _wait_for_job_status(
+                manager, started.job_id, JobStatus.FAILED, timeout=3.0
+            )
+
+            assert failed_attempts == 1
+            assert snapshot.result_meta["failed_from_progress_accounting_stall"] is True
+        finally:
+            stop.set()
+            await _cancel_manager_tasks(manager)
+            await store.close()
+
+    async def test_snapshot_recovers_progress_accounting_failed_terminal_after_restart(
+        self, tmp_path
+    ) -> None:
+        store = _build_store(tmp_path)
+        writer = JobManager(store)
+
+        try:
+            await writer._append_event(
+                "mcp.job.created",
+                "job_recover_failed",
+                {
+                    "job_type": "execute_seed",
+                    "status": JobStatus.RUNNING.value,
+                    "message": "Running execute_seed",
+                    "links": {
+                        "session_id": "orch_recover_failed",
+                        "execution_id": "exec_recover_failed",
+                        "lineage_id": None,
+                    },
+                },
+            )
+            await store.append(
+                BaseEvent(
+                    type="workflow.progress.updated",
+                    aggregate_type="execution",
+                    aggregate_id="exec_recover_failed",
+                    data={
+                        "session_id": "orch_recover_failed",
+                        "completed_count": 0,
+                        "total_count": 1,
+                        "current_phase": "Deliver",
+                    },
+                )
+            )
+            await store.append(
+                BaseEvent(
+                    type="execution.session.completed",
+                    aggregate_type="execution",
+                    aggregate_id="exec_recover_failed_ac_1",
+                    data={
+                        "execution_id": "exec_recover_failed",
+                        "session_id": "child_1",
+                        "session_scope_id": "exec_recover_failed_ac_1",
+                        "success": True,
+                    },
+                )
+            )
+            await store.append(
+                BaseEvent(
+                    type="execution.terminal",
+                    aggregate_type="execution",
+                    aggregate_id="exec_recover_failed",
+                    data={"session_id": "orch_recover_failed", "status": "failed"},
+                )
+            )
+
+            restarted = JobManager(store)
+
+            snapshot = await restarted.get_snapshot("job_recover_failed")
+
+            assert snapshot.status is JobStatus.FAILED
+            assert snapshot.result_meta["failed_from_progress_accounting_stall"] is True
+            assert "workflow progress accounting stalled" in (snapshot.error or "")
+            events, _ = await store.get_events_after("job", "job_recover_failed", last_row_id=0)
+            assert [event.type for event in events] == ["mcp.job.created", "mcp.job.failed"]
+        finally:
+            await store.close()
+
+    async def test_progress_accounting_blocker_waits_for_active_ac_sessions_after_terminal(
+        self, tmp_path
+    ) -> None:
+        store = _build_store(tmp_path)
+        manager = JobManager(store)
+        await store.initialize()
+
+        try:
+            snapshot = JobSnapshot(
+                job_id="job_parallel",
+                job_type="execute_seed",
+                status=JobStatus.RUNNING,
+                message="Running execute_seed",
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+                links=JobLinks(
+                    session_id="orch_parallel_active", execution_id="exec_parallel_active"
+                ),
+            )
+            await store.append(
+                BaseEvent(
+                    type="workflow.progress.updated",
+                    aggregate_type="execution",
+                    aggregate_id="exec_parallel_active",
+                    data={
+                        "session_id": "orch_parallel_active",
+                        "completed_count": 0,
+                        "total_count": 2,
+                        "current_phase": "Deliver",
+                    },
+                )
+            )
+            await store.append(
+                BaseEvent(
+                    type="execution.session.completed",
+                    aggregate_type="execution",
+                    aggregate_id="exec_parallel_active_ac_1",
+                    data={
+                        "execution_id": "exec_parallel_active",
+                        "session_id": "child_1",
+                        "session_scope_id": "exec_parallel_active_ac_1",
+                        "success": True,
+                    },
+                )
+            )
+            await store.append(
+                BaseEvent(
+                    type="execution.session.started",
+                    aggregate_type="execution",
+                    aggregate_id="exec_parallel_active_ac_2",
+                    data={
+                        "execution_id": "exec_parallel_active",
+                        "session_id": "child_2",
+                        "session_scope_id": "exec_parallel_active_ac_2",
+                    },
+                )
+            )
+            await store.append(
+                BaseEvent(
+                    type="execution.terminal",
+                    aggregate_type="execution",
+                    aggregate_id="exec_parallel_active",
+                    data={"session_id": "orch_parallel_active", "status": "failed"},
+                )
+            )
+
+            assert await manager._derive_progress_accounting_blocker(snapshot) is None
+
+            await store.append(
+                BaseEvent(
+                    type="execution.session.failed",
+                    aggregate_type="execution",
+                    aggregate_id="exec_parallel_active_ac_2",
+                    data={
+                        "execution_id": "exec_parallel_active",
+                        "session_id": "child_2",
+                        "session_scope_id": "exec_parallel_active_ac_2",
+                        "success": False,
+                    },
+                )
+            )
+
+            blocker = await manager._derive_progress_accounting_blocker(snapshot)
+
+            assert blocker is not None
+            assert "all known AC runtime sessions were terminal" in blocker
+        finally:
+            await store.close()
+
+    async def test_progress_accounting_blocker_requires_failed_execution_terminal(
+        self, tmp_path
+    ) -> None:
+        store = _build_store(tmp_path)
+        manager = JobManager(store)
+        await store.initialize()
+
+        try:
+            snapshot = JobSnapshot(
+                job_id="job_parallel",
+                job_type="execute_seed",
+                status=JobStatus.RUNNING,
+                message="Running execute_seed",
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+                links=JobLinks(session_id="orch_parallel", execution_id="exec_parallel"),
+            )
+            await store.append(
+                BaseEvent(
+                    type="workflow.progress.updated",
+                    aggregate_type="execution",
+                    aggregate_id="exec_parallel",
+                    data={
+                        "session_id": "orch_parallel",
+                        "completed_count": 0,
+                        "total_count": 2,
+                        "current_phase": "Deliver",
+                    },
+                )
+            )
+            await store.append(
+                BaseEvent(
+                    type="execution.session.completed",
+                    aggregate_type="execution",
+                    aggregate_id="exec_parallel_ac_1",
+                    data={
+                        "execution_id": "exec_parallel",
+                        "session_id": "child_1",
+                        "session_scope_id": "exec_parallel_ac_1",
+                        "success": True,
+                    },
+                )
+            )
+
+            assert await manager._derive_progress_accounting_blocker(snapshot) is None
+
+            await store.append(
+                BaseEvent(
+                    type="execution.terminal",
+                    aggregate_type="execution",
+                    aggregate_id="exec_parallel",
+                    data={"session_id": "orch_parallel", "status": "failed"},
+                )
+            )
+
+            blocker = await manager._derive_progress_accounting_blocker(snapshot)
+
+            assert blocker is not None
+            assert "execution reached terminal failed state" in blocker
+        finally:
+            await store.close()
+
     async def test_cancel_requested_wins_over_complete_execution_terminal(self, tmp_path) -> None:
         store = _build_store(tmp_path)
         manager = JobManager(store)
@@ -733,6 +1117,97 @@ class TestJobManager:
             events, _ = await read_only_store.get_events_after(
                 "job",
                 "job_recover_read_only",
+                last_row_id=0,
+            )
+            terminal_events = [
+                event.type
+                for event in events
+                if event.type
+                in {
+                    "mcp.job.completed",
+                    "mcp.job.failed",
+                    "mcp.job.cancelled",
+                    "mcp.job.interrupted",
+                }
+            ]
+            assert terminal_events == []
+        finally:
+            await read_only_store.close()
+
+    async def test_progress_accounting_failure_recovery_is_non_mutating_for_read_only_store(
+        self, tmp_path
+    ) -> None:
+        store = _build_store(tmp_path)
+        database_url = store._database_url
+
+        try:
+            await store.initialize()
+            await store.append(
+                BaseEvent(
+                    type="mcp.job.created",
+                    aggregate_type="job",
+                    aggregate_id="job_recover_failed_read_only",
+                    data={
+                        "job_type": "execute_seed",
+                        "status": JobStatus.RUNNING.value,
+                        "message": "Running execute_seed",
+                        "links": {
+                            "session_id": "orch_recover_failed_read_only",
+                            "execution_id": "exec_recover_failed_read_only",
+                            "lineage_id": None,
+                        },
+                    },
+                )
+            )
+            await store.append(
+                BaseEvent(
+                    type="workflow.progress.updated",
+                    aggregate_type="execution",
+                    aggregate_id="exec_recover_failed_read_only",
+                    data={
+                        "session_id": "orch_recover_failed_read_only",
+                        "completed_count": 0,
+                        "total_count": 1,
+                        "current_phase": "Deliver",
+                    },
+                )
+            )
+            await store.append(
+                BaseEvent(
+                    type="execution.session.completed",
+                    aggregate_type="execution",
+                    aggregate_id="exec_recover_failed_read_only_ac_1",
+                    data={
+                        "execution_id": "exec_recover_failed_read_only",
+                        "session_id": "child_1",
+                        "session_scope_id": "exec_recover_failed_read_only_ac_1",
+                        "success": True,
+                    },
+                )
+            )
+            await store.append(
+                BaseEvent(
+                    type="execution.terminal",
+                    aggregate_type="execution",
+                    aggregate_id="exec_recover_failed_read_only",
+                    data={"session_id": "orch_recover_failed_read_only", "status": "failed"},
+                )
+            )
+        finally:
+            await store.close()
+
+        read_only_store = EventStore(database_url, read_only=True)
+        read_only_manager = JobManager(read_only_store)
+        try:
+            await read_only_store.initialize(create_schema=False)
+            snapshot = await read_only_manager.get_snapshot("job_recover_failed_read_only")
+
+            assert snapshot.status is JobStatus.FAILED
+            assert snapshot.result_meta["failed_from_progress_accounting_stall"] is True
+            assert "workflow progress accounting stalled" in (snapshot.error or "")
+            events, _ = await read_only_store.get_events_after(
+                "job",
+                "job_recover_failed_read_only",
                 last_row_id=0,
             )
             terminal_events = [
