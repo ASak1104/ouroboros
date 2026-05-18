@@ -25,6 +25,28 @@ _AUTO_WRAPPER_CRITERIA = frozenset(
     }
 )
 
+_OBSERVATION_REPORT_ONLY_CRITERIA = frozenset(
+    {
+        "`ooo auto` is dispatched through the installed ouroboros mcp tool, not interpreted as plain text",
+        "`ooo auto` is dispatched to the mcp tool `ouroboros_auto`",
+        "`ooo auto` is handled by ouroboros auto/mcp, not plain text",
+        "whether mcp dispatch succeeded",
+        "seed reaches grade a",
+        "execution is handed off to the background execution job",
+        "the execution job reaches a terminal status without manual cancellation",
+        "whether progress accounting stalled at ac 0/n is reported",
+        "execution job id",
+        "final execution job terminal status",
+        "whether manual fallback was used",
+        "whether previous blockers recurred",
+        "auto session id",
+        "seed id and seed path",
+        "files changed",
+        "exact test command",
+        "test result",
+    }
+)
+
 _OBSERVATION_CONTEXT_REQUIRED = (
     "hello_auto.py",
     "tests/test_hello_auto.py",
@@ -42,21 +64,56 @@ def normalize_execution_acceptance(seed: Seed) -> Seed:
     Auto observation prompts can include wrapper/reporting duties such as
     dispatch confirmation and final auto-session metadata. Those should not be
     handed to the execution worker as implementation ACs. To avoid mutating
-    product requirements, only strip exact known wrapper criteria when the Seed
-    itself carries auto-wrapper context.
+    product requirements, only normalize the known hello_auto observation
+    context.
     """
     criteria = tuple(ac for ac in seed.acceptance_criteria if ac and ac.strip())
     if not criteria or not _has_auto_wrapper_context(seed.goal, criteria):
         return seed
 
-    filtered = tuple(ac for ac in criteria if not is_auto_reporting_acceptance_criterion(ac))
+    filtered = normalize_observation_execution_criteria(criteria, context_text=seed.goal)
     if not filtered or filtered == criteria:
         return seed
     return seed.model_copy(update={"acceptance_criteria": filtered})
 
 
+def normalize_observation_execution_criteria(
+    criteria: tuple[str, ...],
+    *,
+    context_text: str = "",
+) -> tuple[str, ...]:
+    """Return concrete execution criteria for the hello_auto observation task.
+
+    In the observation context, parent/reporting duties must not become worker
+    ACs.  Keep only concrete local checks and canonicalize equivalent phrasings
+    so the worker sees a small stable AC set.
+    """
+    if not _has_auto_wrapper_context(context_text, criteria):
+        return criteria
+
+    normalized: list[str] = []
+    for criterion in criteria:
+        stripped = criterion.strip()
+        if not stripped:
+            continue
+        if is_auto_reporting_acceptance_criterion(stripped) or _is_observation_report_only_line(
+            stripped
+        ):
+            continue
+        normalized.append(_normalize_known_observation_execution_line(stripped))
+
+    return tuple(dict.fromkeys(normalized))
+
+
 def is_auto_reporting_acceptance_criterion(criterion: str) -> bool:
-    """Return true only for exact known auto wrapper/report-only criteria."""
+    """Return true only for exact known auto wrapper/report-only criteria.
+
+    Broad observation-only report markers are intentionally handled behind the
+    hello_auto observation context gate in ``normalize_observation_execution_criteria``.
+    Keeping this standalone helper exact prevents unrelated product requirements
+    such as execution-job or progress-accounting features from being classified
+    as reporting metadata by a future caller that lacks the observation guard.
+    """
     return _criterion_key(criterion) in _AUTO_WRAPPER_CRITERIA
 
 
@@ -74,3 +131,38 @@ def _has_auto_wrapper_context(goal: str, criteria: tuple[str, ...]) -> bool:
 
 def _criterion_key(criterion: str) -> str:
     return " ".join(criterion.casefold().strip().rstrip(".").split())
+
+
+def _normalize_known_observation_execution_line(criterion: str) -> str:
+    """Canonicalize only known-equivalent hello_auto execution AC phrasings."""
+    key = _criterion_key(criterion)
+    hello_return_equivalents = {
+        "`hello_auto.py` defines `hello_auto()` returning exactly `hello from ooo auto`",
+        "`hello_auto.py` defines `hello_auto() -> str` returning exactly `hello from ooo auto`",
+        "hello_auto.py defines hello_auto() returning exactly hello from ooo auto",
+        "hello_auto.py defines hello_auto() -> str returning exactly hello from ooo auto",
+    }
+    test_file_equivalents = {
+        "`tests/test_hello_auto.py` imports `hello_auto` and asserts the exact return value",
+        "tests/test_hello_auto.py imports hello_auto and asserts the exact return value",
+    }
+    pytest_equivalents = {
+        "`uv run pytest tests/test_hello_auto.py` passes",
+        "uv run pytest tests/test_hello_auto.py passes",
+        "the exact command `uv run pytest tests/test_hello_auto.py` passes",
+        "the targeted test command `uv run pytest tests/test_hello_auto.py` passes",
+    }
+    if key in hello_return_equivalents:
+        return (
+            "`hello_auto.py` defines `hello_auto() -> str` returning exactly `hello from ooo auto`."
+        )
+    if key in test_file_equivalents:
+        return "`tests/test_hello_auto.py` imports `hello_auto` and asserts the exact return value."
+    if key in pytest_equivalents:
+        return "The exact command `uv run pytest tests/test_hello_auto.py` passes."
+    return criterion
+
+
+def _is_observation_report_only_line(criterion: str) -> bool:
+    """Classify exact known observation metadata lines from the parent report."""
+    return _criterion_key(criterion) in _OBSERVATION_REPORT_ONLY_CRITERIA

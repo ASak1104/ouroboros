@@ -374,7 +374,7 @@ If `ouroboros_auto` is unavailable or interpreted as normal text, stop and repor
     assert preferences["acceptance_criteria"] == (
         "`hello_auto.py` exists.\n"
         "`tests/test_hello_auto.py` exists.\n"
-        "The targeted test command `uv run pytest tests/test_hello_auto.py` passes."
+        "The exact command `uv run pytest tests/test_hello_auto.py` passes."
     )
     assert "Previous last_question" in preferences["failure_modes"]
     assert "Manual fallback used: no." in preferences["failure_modes"]
@@ -409,9 +409,52 @@ After auto finishes, report:
     assert preferences["acceptance_criteria"] == (
         "`hello_auto.py` exists.\n"
         "`tests/test_hello_auto.py` exists.\n"
-        "The targeted test command `uv run pytest tests/test_hello_auto.py` passes."
+        "The exact command `uv run pytest tests/test_hello_auto.py` passes."
     )
     assert "auto session id" not in preferences["acceptance_criteria"].casefold()
+    assert "execution job" not in preferences["acceptance_criteria"].casefold()
+    assert "test result" not in preferences["acceptance_criteria"].casefold()
+
+
+def test_structured_auto_goal_canonicalizes_latest_observation_success_criteria() -> None:
+    goal = """
+Observation run: verify latest main Ouroboros `ooo auto` execution lifecycle after the merged fixes.
+
+Goal:
+Create a minimal local proof file and test.
+
+Implementation:
+- Create `hello_auto.py` at the repository root.
+- Define `hello_auto() -> str`.
+- It must return exactly `hello from ooo auto`.
+- Create `tests/test_hello_auto.py`.
+- The test must import `hello_auto` and assert the exact return value.
+
+Success criteria:
+- `ooo auto` is dispatched through the installed Ouroboros MCP tool, not interpreted as plain text.
+- Seed reaches grade A.
+- Execution is handed off to the background execution job.
+- `hello_auto.py` exists.
+- `tests/test_hello_auto.py` exists.
+- `uv run pytest tests/test_hello_auto.py` passes.
+- The execution job reaches a terminal status without manual cancellation.
+
+After auto finishes, report:
+- Whether MCP dispatch succeeded.
+- Execution job id.
+- Whether progress accounting stalled at AC 0/N.
+- Files changed.
+- Exact test command.
+- Test result.
+"""
+
+    preferences = _derive_goal_user_preferences(goal)
+
+    assert preferences["acceptance_criteria"] == (
+        "`hello_auto.py` exists.\n"
+        "`tests/test_hello_auto.py` exists.\n"
+        "The exact command `uv run pytest tests/test_hello_auto.py` passes."
+    )
     assert "execution job" not in preferences["acceptance_criteria"].casefold()
     assert "test result" not in preferences["acceptance_criteria"].casefold()
 
