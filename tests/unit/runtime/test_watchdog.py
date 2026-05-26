@@ -26,6 +26,22 @@ class _CapturingAppender:
     async def append(self, event: BaseEvent) -> None:
         self.events.append(event)
 
+    async def query_events(
+        self,
+        aggregate_id: str | None = None,
+        event_type: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[BaseEvent]:
+        del offset
+        events = [
+            event
+            for event in self.events
+            if (aggregate_id is None or event.aggregate_id == aggregate_id)
+            and (event_type is None or event.type == event_type)
+        ]
+        return events[:limit]
+
 
 def _fixed_now(value: datetime):
     return lambda: value
@@ -122,6 +138,72 @@ async def test_idempotent_within_instance() -> None:
     assert second is None
     assert len(appender.events) == 1
     assert watchdog.has_fired_for("auto_dup")
+
+
+@pytest.mark.asyncio
+async def test_idempotent_across_new_instance_when_event_exists() -> None:
+    """A restarted watchdog replays cancellation without appending again."""
+    started = datetime(2026, 5, 22, 10, 0, 0, tzinfo=UTC)
+    appender = _CapturingAppender()
+    first = Watchdog(
+        controls=RuntimeControls(session_wall_clock_seconds=10),
+        event_appender=appender,
+        now=_fixed_now(started + timedelta(seconds=60)),
+    )
+    second = Watchdog(
+        controls=RuntimeControls(session_wall_clock_seconds=10),
+        event_appender=appender,
+        now=_fixed_now(started + timedelta(seconds=120)),
+    )
+
+    assert await first.check(session_id="auto_restart", session_started_at=started) is not None
+    replayed = await second.check(session_id="auto_restart", session_started_at=started)
+
+    assert replayed is not None
+    assert replayed.session_id == "auto_restart"
+    assert replayed.elapsed_seconds == 60
+    assert len(appender.events) == 1
+    assert second.has_fired_for("auto_restart")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resumed_budget", [0, 10_000])
+async def test_existing_cancel_replays_before_current_budget_gates(resumed_budget: int) -> None:
+    """Persisted cancellation remains terminal even if resume controls change."""
+    started = datetime(2026, 5, 22, 10, 0, 0, tzinfo=UTC)
+    fired_at = started + timedelta(seconds=60)
+    appender = _CapturingAppender()
+    appender.events.append(
+        BaseEvent(
+            type=WATCHDOG_CANCEL_EVENT_TYPE,
+            aggregate_type=WATCHDOG_AGGREGATE_TYPE,
+            aggregate_id="auto_resume_control_drift",
+            data={
+                "reason": "wall_clock_exceeded",
+                "session_started_at": started.isoformat(),
+                "fired_at": fired_at.isoformat(),
+                "elapsed_seconds": 60,
+                "configured_budget_seconds": 10,
+            },
+        )
+    )
+    watchdog = Watchdog(
+        controls=RuntimeControls(session_wall_clock_seconds=resumed_budget),
+        event_appender=appender,
+        now=_fixed_now(started + timedelta(seconds=120)),
+    )
+
+    replayed = await watchdog.check(
+        session_id="auto_resume_control_drift",
+        session_started_at=started,
+    )
+
+    assert replayed is not None
+    assert replayed.fired_at == fired_at
+    assert replayed.elapsed_seconds == 60
+    assert replayed.configured_budget_seconds == 10
+    assert len(appender.events) == 1
+    assert watchdog.has_fired_for("auto_resume_control_drift")
 
 
 @pytest.mark.asyncio

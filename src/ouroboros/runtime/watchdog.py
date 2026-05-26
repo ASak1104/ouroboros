@@ -36,7 +36,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from ouroboros.events.base import BaseEvent
 from ouroboros.runtime.controls import RuntimeControls
@@ -64,6 +64,7 @@ WATCHDOG_STOP_REASON_CODE: str = "watchdog_wall_clock_exceeded"
 cancel event is observed."""
 
 
+@runtime_checkable
 class _EventAppender(Protocol):
     """Minimal protocol the watchdog needs from the EventStore.
 
@@ -73,6 +74,19 @@ class _EventAppender(Protocol):
     """
 
     async def append(self, event: BaseEvent) -> None: ...
+
+
+@runtime_checkable
+class _WatchdogEventReader(Protocol):
+    """Optional EventStore replay hook used for restart idempotency."""
+
+    async def query_events(
+        self,
+        aggregate_id: str | None = None,
+        event_type: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[BaseEvent]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,13 +185,21 @@ class Watchdog:
         ``runtime.watchdog.cancel`` event is appended to the
         configured event appender.
         """
-        if not self._controls.watchdog_enabled:
-            return None
         if session_id in self._fired_sessions:
             return None
         now = self._now()
         elapsed_seconds = int((now - session_started_at).total_seconds())
         budget = self._controls.session_wall_clock_seconds
+        replayed = await self._replay_existing_decision(
+            session_id=session_id,
+            fired_at_default=now,
+            elapsed_seconds_default=elapsed_seconds,
+            budget_default=budget,
+        )
+        if replayed is not None:
+            return replayed
+        if not self._controls.watchdog_enabled:
+            return None
         if elapsed_seconds <= budget:
             return None
         decision = WatchdogDecision(
@@ -202,7 +224,60 @@ class Watchdog:
         self._fired_sessions.add(session_id)
         return decision
 
+    async def _replay_existing_decision(
+        self,
+        *,
+        session_id: str,
+        fired_at_default: datetime,
+        elapsed_seconds_default: int,
+        budget_default: int,
+    ) -> WatchdogDecision | None:
+        """Replay a persisted cancel event before evaluating current controls."""
+        if isinstance(self._appender, _WatchdogEventReader):
+            existing = await self._appender.query_events(
+                aggregate_id=session_id,
+                event_type=WATCHDOG_CANCEL_EVENT_TYPE,
+                limit=1,
+            )
+            if existing:
+                self._fired_sessions.add(session_id)
+                event = existing[0]
+                fired_at = _coerce_datetime(event.data.get("fired_at")) or fired_at_default
+                return WatchdogDecision(
+                    session_id=session_id,
+                    fired_at=fired_at,
+                    elapsed_seconds=_coerce_int(
+                        event.data.get("elapsed_seconds"),
+                        default=elapsed_seconds_default,
+                    ),
+                    configured_budget_seconds=_coerce_int(
+                        event.data.get("configured_budget_seconds"),
+                        default=budget_default,
+                    ),
+                )
+        return None
+
     def has_fired_for(self, session_id: str) -> bool:
         """Test/inspection helper — True iff this instance has already
         fired the watchdog for *session_id*."""
         return session_id in self._fired_sessions
+
+
+def _coerce_datetime(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _coerce_int(value: object, *, default: int) -> int:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return default
+    return default
