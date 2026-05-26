@@ -919,7 +919,14 @@ def _test_command_invocation(command: str) -> str | None:
     if not normalized:
         return None
 
-    direct = _test_invocation_from_prefix(_strip_command_output_plumbing(normalized))
+    direct_candidate = _strip_command_output_plumbing(normalized)
+    if (
+        _has_trailing_output_filter_pipeline(normalized)
+        and not _output_filter_pipeline_is_pipefail_protected(normalized)
+        and _test_invocation_from_prefix(direct_candidate) is not None
+    ):
+        direct_candidate = normalized
+    direct = _test_invocation_from_prefix(direct_candidate)
     if direct is not None:
         return direct
 
@@ -951,8 +958,15 @@ def _shell_command_body(command: str) -> str | None:
 
 def _test_invocation_from_shell_body(body: str) -> str | None:
     """Return a test invocation after conservative shell setup preambles."""
-    for segment in _segments_after_safe_shell_preamble(body):
-        invocation = _test_invocation_from_prefix(_strip_command_output_plumbing(segment))
+    for segment, pipefail_enabled in _segments_after_safe_shell_preamble_with_pipefail(body):
+        candidate = _strip_command_output_plumbing(segment)
+        if (
+            _has_trailing_output_filter_pipeline(segment)
+            and not pipefail_enabled
+            and _test_invocation_from_prefix(candidate) is not None
+        ):
+            candidate = segment
+        invocation = _test_invocation_from_prefix(candidate)
         if invocation is not None:
             return invocation
         return None
@@ -973,19 +987,38 @@ def _single_command_after_safe_shell_preamble(command: str) -> str | None:
     segments = tuple(_segments_after_safe_shell_preamble(body))
     if len(segments) != 1:
         return None
-    return _normalized_evidence_text(_strip_command_output_plumbing(segments[0]))
+    segment = segments[0]
+    stripped = _strip_command_output_plumbing(segment)
+    if (
+        _has_trailing_output_filter_pipeline(segment)
+        and not _output_filter_pipeline_is_pipefail_protected(body)
+        and _looks_like_test_command(stripped)
+    ):
+        return None
+    return _normalized_evidence_text(stripped)
 
 
 def _segments_after_safe_shell_preamble(body: str) -> tuple[str, ...]:
     """Return non-preamble shell segments after setup-only commands."""
-    remaining: list[str] = []
+    return tuple(
+        segment
+        for segment, _pipefail_enabled in _segments_after_safe_shell_preamble_with_pipefail(body)
+    )
+
+
+def _segments_after_safe_shell_preamble_with_pipefail(body: str) -> tuple[tuple[str, bool], ...]:
+    """Return non-preamble segments with pipefail state active before each one."""
+    remaining: list[tuple[str, bool]] = []
+    pipefail_enabled = False
     for segment in re.split(r"\s*&&\s*", body.strip()):
         normalized_segment = segment.strip()
         if not normalized_segment:
             continue
         if not remaining and _is_safe_test_command_preamble(normalized_segment):
+            if _is_pipefail_preamble(normalized_segment):
+                pipefail_enabled = True
             continue
-        remaining.append(normalized_segment)
+        remaining.append((normalized_segment, pipefail_enabled))
     return tuple(remaining)
 
 
@@ -998,6 +1031,8 @@ def _is_safe_test_command_preamble(segment: str) -> bool:
     if not parts:
         return True
     if parts[0] == "cd" and len(parts) == 2:
+        return True
+    if _is_pipefail_parts(parts):
         return True
     if parts[0] == "export" and len(parts) > 1:
         return all(_is_env_assignment(part) for part in parts[1:])
@@ -1133,6 +1168,57 @@ def _strip_command_output_plumbing(command: str) -> str:
     return text
 
 
+def _has_trailing_output_filter_pipeline(command: str) -> bool:
+    """Return True when ``command`` ends in a pager-style output pipe."""
+    text = command.strip()
+    while "|" in text:
+        head, _, tail_segment = text.rpartition("|")
+        tail_tokens = tail_segment.split()
+        if tail_tokens and tail_tokens[0].lower() in _OUTPUT_FILTER_COMMANDS:
+            return True
+        text = head.strip()
+    return False
+
+
+def _output_filter_pipeline_is_pipefail_protected(command: str) -> bool:
+    """Return True when pipefail is enabled before the first stripped pipeline."""
+    pipefail_enabled = False
+    for segment in re.split(r"\s*(?:&&|;)\s*", command.strip()):
+        normalized_segment = segment.strip()
+        if not normalized_segment:
+            continue
+        if _is_pipefail_preamble(normalized_segment):
+            pipefail_enabled = True
+            continue
+        if _has_trailing_output_filter_pipeline(normalized_segment):
+            return pipefail_enabled
+    return False
+
+
+def _uses_pipefail(command: str) -> bool:
+    """Return True when shell text explicitly preserves upstream pipe status."""
+    for segment in re.split(r"\s*(?:&&|;)\s*", command.strip()):
+        try:
+            parts = shlex.split(segment)
+        except ValueError:
+            continue
+        if _is_pipefail_parts(parts):
+            return True
+    return False
+
+
+def _is_pipefail_preamble(segment: str) -> bool:
+    try:
+        parts = shlex.split(segment)
+    except ValueError:
+        return False
+    return _is_pipefail_parts(parts)
+
+
+def _is_pipefail_parts(parts: list[str]) -> bool:
+    return parts == ["set", "-o", "pipefail"]
+
+
 def _normalized_command_claim_aliases(command: str) -> tuple[str, ...]:
     """Return normalized command forms that a concise evidence claim may use.
 
@@ -1158,6 +1244,14 @@ def _normalized_command_claim_aliases(command: str) -> tuple[str, ...]:
     # this does not widen proof to arbitrary substrings.
     for base in tuple(aliases):
         stripped = _normalized_evidence_text(_strip_command_output_plumbing(base))
+        if (
+            stripped
+            and stripped != base
+            and _has_trailing_output_filter_pipeline(base)
+            and _looks_like_test_command(stripped)
+            and not _output_filter_pipeline_is_pipefail_protected(base)
+        ):
+            continue
         if stripped and stripped not in aliases:
             aliases.append(stripped)
     return tuple(aliases)
