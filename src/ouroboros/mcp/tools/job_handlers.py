@@ -216,50 +216,117 @@ def _event_stream_item(event: BaseEvent) -> dict[str, Any]:
     }
 
 
+def _compact_stream_suffix(
+    stream_items: list[dict[str, Any]],
+    cursor: int,
+    *,
+    has_more: bool = False,
+) -> str:
+    """One-line linked-stream summary appended to compact/summary job views.
+
+    Empty when no linked events were streamed, so callers can unconditionally
+    concatenate the result without re-checking ``stream_items``. ``has_more``
+    appends a ``more=1`` marker signalling the caller should poll again with the
+    returned cursor to drain the rest of a bounded linked-stream page.
+    """
+    if not stream_items:
+        return ""
+    suffix = f"\nstream_events {len(stream_items)} cursor={cursor}"
+    if has_more:
+        suffix += " more=1"
+    return suffix
+
+
 async def _query_linked_stream_events(
     event_store: EventStore,
     snapshot: JobSnapshot,
     cursor: int,
-) -> tuple[list[BaseEvent], int]:
-    """Fetch new events from the job's linked execution/session/lineage streams."""
-    collected: dict[str, BaseEvent] = {}
-    max_cursor = cursor
+    *,
+    limit: int = _JOB_STREAM_EVENT_LIMIT,
+) -> tuple[list[BaseEvent], int, bool]:
+    """Fetch a bounded page of new events from the job's linked streams.
 
-    async def collect(events: list[BaseEvent], new_cursor: int) -> None:
-        nonlocal max_cursor
-        max_cursor = max(max_cursor, new_cursor)
-        for event in events:
-            collected[event.id] = event
+    Linked streams (job/execution/session/lineage) share one rowid cursor, so
+    the page is delivered as a single global rowid window ``(cursor, boundary]``:
 
-    job_events, job_cursor = await event_store.get_events_after("job", snapshot.job_id, cursor)
-    await collect(job_events, job_cursor)
+    1. Peek each stream with a rowid-ordered ``limit`` (bounded reads, so a stale
+       or first ``stream="linked"`` poll over a long-running auto/session cannot
+       materialize an unbounded query/response). A stream that returns a full
+       page may have more rows past it.
+    2. Clamp ``boundary`` to the lowest saturated stream cursor — the highest
+       rowid below which *every* stream's knowledge is complete — then re-read
+       each stream only up to ``boundary``.
 
-    if snapshot.links.execution_id:
-        execution_events, execution_cursor = await event_store.get_events_after(
-            "execution",
-            snapshot.links.execution_id,
-            cursor,
-        )
-        await collect(execution_events, execution_cursor)
+    Because rowid order is the cursor dimension, ``boundary`` is skip-safe even
+    when timestamp order diverges from insertion order, and no event past
+    ``boundary`` is returned, so the follow-up poll (cursor=boundary) never
+    re-delivers or skips an event. ``has_more`` is True when a stream still has
+    rows beyond ``boundary``. The page is bounded by ``links × limit`` events.
+    """
 
-    if snapshot.links.session_id:
-        session_events, session_cursor = await event_store.query_session_related_events_after(
-            session_id=snapshot.links.session_id,
-            execution_id=snapshot.links.execution_id,
-            last_row_id=cursor,
-        )
-        await collect(session_events, session_cursor)
+    async def gather(
+        page_limit: int | None, max_row_id: int | None
+    ) -> list[tuple[list[BaseEvent], int]]:
+        """Read every linked stream with a shared (limit, max_row_id) contract."""
+        results: list[tuple[list[BaseEvent], int]] = [
+            await event_store.get_events_after(
+                "job", snapshot.job_id, cursor, limit=page_limit, max_row_id=max_row_id
+            )
+        ]
+        if snapshot.links.execution_id:
+            results.append(
+                await event_store.get_events_after(
+                    "execution",
+                    snapshot.links.execution_id,
+                    cursor,
+                    limit=page_limit,
+                    max_row_id=max_row_id,
+                )
+            )
+        if snapshot.links.session_id:
+            results.append(
+                await event_store.query_session_related_events_after(
+                    session_id=snapshot.links.session_id,
+                    execution_id=snapshot.links.execution_id,
+                    last_row_id=cursor,
+                    limit=page_limit,
+                    max_row_id=max_row_id,
+                )
+            )
+        if snapshot.links.lineage_id:
+            results.append(
+                await event_store.get_events_after(
+                    "lineage",
+                    snapshot.links.lineage_id,
+                    cursor,
+                    limit=page_limit,
+                    max_row_id=max_row_id,
+                )
+            )
+        return results
 
-    if snapshot.links.lineage_id:
-        lineage_events, lineage_cursor = await event_store.get_events_after(
-            "lineage",
-            snapshot.links.lineage_id,
-            cursor,
-        )
-        await collect(lineage_events, lineage_cursor)
+    def merge(results: list[tuple[list[BaseEvent], int]]) -> list[BaseEvent]:
+        collected: dict[str, BaseEvent] = {}
+        for events, _new_cursor in results:
+            for event in events:
+                collected[event.id] = event
+        return sorted(collected.values(), key=lambda event: (event.timestamp, event.id))
 
-    events = sorted(collected.values(), key=lambda event: (event.timestamp, event.id))
-    return events[-_JOB_STREAM_EVENT_LIMIT:], max_cursor
+    # Pass 1: bounded rowid-ordered peek to discover the global page boundary.
+    peeked = await gather(limit, None)
+    saturated = [new_cursor for events, new_cursor in peeked if len(events) >= limit]
+
+    if not saturated:
+        # Every stream is fully drained to the global head; the peek is complete.
+        next_cursor = max([cursor, *(new_cursor for _events, new_cursor in peeked)])
+        return merge(peeked), next_cursor, False
+
+    # Pass 2: clamp to the lowest saturated boundary and re-read each stream only
+    # up to it, yielding a contiguous rowid window with no skips and no rows past
+    # the cursor handed back. boundary > cursor (page rowids are all > cursor), so
+    # the next poll strictly advances.
+    boundary = min(saturated)
+    return merge(await gather(None, boundary)), boundary, True
 
 
 @dataclass
@@ -937,6 +1004,7 @@ class JobWaitHandler:
                     changed,
                     stream_events,
                     stream_cursor,
+                    stream_has_more,
                 ) = await self._wait_for_linked_change(
                     job_id,
                     cursor=cursor,
@@ -950,6 +1018,7 @@ class JobWaitHandler:
                 )
                 stream_events = []
                 stream_cursor = cursor
+                stream_has_more = False
         except ValueError as exc:
             return Result.err(
                 MCPToolError(
@@ -972,8 +1041,18 @@ class JobWaitHandler:
             )
 
         execution_progress_changed = False
-        response_cursor = max(snapshot.cursor, stream_cursor, cursor)
-        if snapshot.links.execution_id:
+        if stream == "linked":
+            # Execution events are already part of the bounded linked page, and
+            # `_wait_for_linked_change` pinned the cursor to that page boundary.
+            # Derive the progress signal from the page itself and never advance
+            # the public cursor past the boundary here: a separate execution scan
+            # could otherwise publish a rowid above a held-back lower-rowid stream
+            # event, skipping it on the next poll.
+            execution_progress_changed = any(
+                event.type in _JOB_PROGRESS_EVENT_TYPES for event in stream_events
+            )
+        elif snapshot.links.execution_id:
+            response_cursor = max(snapshot.cursor, stream_cursor, cursor)
             execution_events, execution_cursor = await self._event_store.get_events_after(
                 "execution",
                 snapshot.links.execution_id,
@@ -993,6 +1072,8 @@ class JobWaitHandler:
             for item in stream_items[-_JOB_STREAM_EVENT_LIMIT:]:
                 detail = f" -- {item['detail']}" if item["detail"] else ""
                 text += f"\n- `{item['type']}` [{item['scope']}]{detail}"
+            if stream_has_more:
+                text += f"\n\nMore linked events pending; poll again with cursor={snapshot.cursor}."
         has_live_execution_progress = snapshot.links.execution_id is not None and any(
             progress.get(key) is not None
             for key in (
@@ -1016,13 +1097,16 @@ class JobWaitHandler:
                     progress,
                     include_message=view == "summary",
                 )
-                if stream_items:
-                    text += f"\nstream_events {len(stream_items)} cursor={snapshot.cursor}"
+                text += _compact_stream_suffix(
+                    stream_items, snapshot.cursor, has_more=stream_has_more
+                )
             elif view in {"compact", "summary"}:
                 if stream_items:
                     summaries = ", ".join(item["type"] for item in stream_items[-3:])
+                    more = " more=1" if stream_has_more else ""
                     text = (
-                        f"stream_events {len(stream_items)} cursor={snapshot.cursor}: {summaries}"
+                        f"stream_events {len(stream_items)} "
+                        f"cursor={snapshot.cursor}{more}: {summaries}"
                     )
                 else:
                     text = f"unchanged cursor={snapshot.cursor}"
@@ -1034,12 +1118,10 @@ class JobWaitHandler:
                 text += "\n\nNo new job-level events during this wait window."
         elif view == "compact":
             text = _render_compact_job_snapshot(snapshot, progress, include_message=False)
-            if stream_items:
-                text += f"\nstream_events {len(stream_items)} cursor={snapshot.cursor}"
+            text += _compact_stream_suffix(stream_items, snapshot.cursor, has_more=stream_has_more)
         elif view == "summary":
             text = _render_compact_job_snapshot(snapshot, progress, include_message=True)
-            if stream_items:
-                text += f"\nstream_events {len(stream_items)} cursor={snapshot.cursor}"
+            text += _compact_stream_suffix(stream_items, snapshot.cursor, has_more=stream_has_more)
         return Result.ok(
             MCPToolResult(
                 content=(MCPContentItem(type=ContentType.TEXT, text=text),),
@@ -1050,6 +1132,7 @@ class JobWaitHandler:
                     "view": view,
                     "stream": stream,
                     "stream_events": stream_items,
+                    "stream_has_more": stream_has_more,
                     **progress,
                 },
             )
@@ -1061,7 +1144,7 @@ class JobWaitHandler:
         *,
         cursor: int,
         timeout_seconds: int,
-    ) -> tuple[JobSnapshot, bool, list[BaseEvent], int]:
+    ) -> tuple[JobSnapshot, bool, list[BaseEvent], int, bool]:
         """Long-poll job plus linked child/session event streams."""
         deadline = asyncio.get_running_loop().time() + timeout_seconds
         while True:
@@ -1070,7 +1153,7 @@ class JobWaitHandler:
                 cursor=cursor,
                 timeout_seconds=0,
             )
-            events, stream_cursor = await _query_linked_stream_events(
+            events, stream_cursor, has_more = await _query_linked_stream_events(
                 self._event_store,
                 snapshot,
                 cursor,
@@ -1081,9 +1164,13 @@ class JobWaitHandler:
                 or snapshot.is_terminal
                 or asyncio.get_running_loop().time() >= deadline
             ):
-                if stream_cursor != snapshot.cursor:
-                    snapshot = replace(snapshot, cursor=max(snapshot.cursor, stream_cursor))
-                return snapshot, changed, events, stream_cursor
+                # Pin the public cursor to the linked page boundary (not max with
+                # the job-manager cursor): the boundary uniformly bounds every
+                # linked stream including job, so a higher job cursor would skip
+                # held-back lower-rowid events from a clamped sibling stream.
+                if snapshot.cursor != stream_cursor:
+                    snapshot = replace(snapshot, cursor=stream_cursor)
+                return snapshot, changed, events, stream_cursor, has_more
             await asyncio.sleep(0.5)
 
 
