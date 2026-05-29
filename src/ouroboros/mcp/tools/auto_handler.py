@@ -780,9 +780,11 @@ class StartAutoHandler:
             )
 
         text = (
-            f"Started background auto session. job_id={snapshot.job_id}\n\n"
-            f"Auto session ID: {auto_session_id}\n\n"
-            "Poll with ouroboros_job_status / ouroboros_job_wait."
+            "Started background auto session.\n\n"
+            "Status: queued\n\n"
+            "Track with ouroboros_job_wait / ouroboros_job_status until terminal, "
+            "then fetch ouroboros_job_result. Use response metadata for job_id "
+            "and auto_session_id."
         )
         return Result.ok(
             MCPToolResult(
@@ -794,6 +796,9 @@ class StartAutoHandler:
                     "session_id": auto_session_id,
                     "status": "queued",
                     "dispatch_mode": "job",
+                    "status_tool": "ouroboros_job_status",
+                    "wait_tool": "ouroboros_job_wait",
+                    "result_tool": "ouroboros_job_result",
                 },
             )
         )
@@ -1346,6 +1351,13 @@ async def _reconcile_execution_job_snapshot(result: AutoPipelineResult) -> AutoP
     """Project the linked execution job lifecycle onto the auto resume result."""
     if not result.job_id:
         return result
+    if (
+        result.status == "detached"
+        or result.phase == AutoPhase.RALPH_HANDOFF.value
+        or result.ralph_job_id
+        or result.ralph_lineage_id
+    ):
+        return result
     try:
         snapshot = await JobManager().get_snapshot(result.job_id)
     except Exception:
@@ -1372,10 +1384,12 @@ async def _reconcile_execution_job_snapshot(result: AutoPipelineResult) -> AutoP
         resume_capability = AutoResumeCapability.NONE
     elif snapshot.status is JobStatus.COMPLETED:
         status = "complete"
+        blocker = None
         resume_capability = AutoResumeCapability.NONE
     return replace(
         result,
         status=status,
+        phase="complete" if status == "complete" else result.phase,
         blocker=blocker,
         resume_capability=resume_capability,
         execution_job_status=snapshot.status.value,
