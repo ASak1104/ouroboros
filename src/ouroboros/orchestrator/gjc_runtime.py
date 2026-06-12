@@ -27,11 +27,14 @@ from ouroboros.orchestrator.adapter import (
 )
 from ouroboros.orchestrator.skill_intercept import SkillInterceptor
 from ouroboros.providers.gjc_rpc_protocol import (
+    SUPPORTED_EVENT_TYPES,
     GjcCommandError,
     GjcProtocolError,
     UnsupportedGjcRpcFrame,
     is_passive_lifecycle_event,
+    unsupported_enveloped_frame_error,
     unsupported_frame_error,
+    unwrap_event_envelope,
     validate_response_ack,
 )
 
@@ -141,7 +144,9 @@ class GjcRuntime:
         return str(path) if path.exists() else candidate
 
     def _build_command(self, *, prompt: str) -> list[str]:
-        return [self._cli_path, "--mode", "rpc"]
+        # --no-session: one task per process, never resumed (targeted_resume is
+        # False), so persisting gjc session files would only accumulate noise.
+        return [self._cli_path, "--mode", "rpc", "--no-session"]
 
     def _build_child_env(self) -> dict[str, str]:
         env = os.environ.copy()
@@ -456,14 +461,18 @@ class GjcRuntime:
                         "modelId": override[1],
                     },
                 )
-                event = self._parse_event(await anext(line_iter))
-                self._check_unsupported_or_unknown(event)
-                validate_response_ack(
-                    event,
-                    command_id=model_command_id,
-                    command="set_model",
-                    provider=self._provider_name,
-                )
+                while True:
+                    event = self._parse_event(await anext(line_iter))
+                    if unwrap_event_envelope(event, provider=self._provider_name) is not None:
+                        continue
+                    self._check_unsupported_or_unknown(event)
+                    validate_response_ack(
+                        event,
+                        command_id=model_command_id,
+                        command="set_model",
+                        provider=self._provider_name,
+                    )
+                    break
                 log.info(f"{self._log_namespace}.model_acknowledged")
             prompt_command_id = f"prompt-{uuid4().hex}"
             await self._send_command(
@@ -474,8 +483,23 @@ class GjcRuntime:
                 if not line:
                     continue
                 event = self._parse_event(line)
+                inner = unwrap_event_envelope(event, provider=self._provider_name)
+                if inner is not None:
+                    event = inner
+                    if event.get("type") not in SUPPORTED_EVENT_TYPES:
+                        error = unsupported_enveloped_frame_error(
+                            event, provider=self._provider_name
+                        )
+                        if error is not None:
+                            raise error
+                        log.debug(
+                            f"{self._log_namespace}.unknown_enveloped_event",
+                            event_type=event.get("type"),
+                        )
+                        continue
+                else:
+                    self._check_unsupported_or_unknown(event)
                 event_type = event.get("type")
-                self._check_unsupported_or_unknown(event)
                 if event_type == "response" and event.get("id") == prompt_command_id:
                     validate_response_ack(
                         event,

@@ -27,9 +27,12 @@ from ouroboros.providers.base import (
 )
 from ouroboros.providers.codex_cli_adapter import CodexCliLLMAdapter
 from ouroboros.providers.gjc_rpc_protocol import (
+    SUPPORTED_EVENT_TYPES,
     GjcProtocolError,
     is_passive_lifecycle_event,
+    unsupported_enveloped_frame_error,
     unsupported_frame_error,
+    unwrap_event_envelope,
     validate_response_ack,
 )
 from ouroboros.providers.profiles import resolve_completion_profile_result
@@ -163,7 +166,9 @@ class GjcLLMAdapter(CodexCliLLMAdapter):
             return None
         if not _SAFE_MODEL_PART_PATTERN.fullmatch(provider):
             return None
-        if not _SAFE_MODEL_PART_PATTERN.fullmatch(model_id):
+        # Model ids may themselves be slash-qualified (openrouter/google/gemini-3-pro);
+        # validate each segment instead of rejecting the whole id.
+        if not all(_SAFE_MODEL_PART_PATTERN.fullmatch(part) for part in model_id.split("/")):
             return None
         return provider, model_id
 
@@ -201,6 +206,10 @@ class GjcLLMAdapter(CodexCliLLMAdapter):
             return ""
         assistant_event = event.get("assistantMessageEvent")
         if isinstance(assistant_event, dict):
+            # Only text deltas count as completion output; thinking_* and
+            # text_start/text_end variants would duplicate or pollute content.
+            if assistant_event.get("type") not in {None, "text_delta"}:
+                return ""
             delta = (
                 assistant_event.get("delta")
                 or assistant_event.get("text")
@@ -287,11 +296,12 @@ class GjcLLMAdapter(CodexCliLLMAdapter):
     ) -> Result[CompletionResponse, ProviderError]:
         process: Any | None = None
         stderr_task: asyncio.Task[list[str]] | None = None
+        command = [self._cli_path, "--mode", "rpc"]
+        if self._ephemeral:
+            command.append("--no-session")
         try:
             process = await asyncio.create_subprocess_exec(
-                self._cli_path,
-                "--mode",
-                "rpc",
+                *command,
                 cwd=self._cwd,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
@@ -370,14 +380,18 @@ class GjcLLMAdapter(CodexCliLLMAdapter):
                             "modelId": model_id,
                         },
                     )
-                    ack = await next_event()
-                    self._check_unsupported_or_unknown(ack)
-                    validate_response_ack(
-                        ack,
-                        command_id=set_model_id,
-                        command="set_model",
-                        provider=self._provider_name,
-                    )
+                    while True:
+                        ack = await next_event()
+                        if unwrap_event_envelope(ack, provider=self._provider_name) is not None:
+                            continue
+                        self._check_unsupported_or_unknown(ack)
+                        validate_response_ack(
+                            ack,
+                            command_id=set_model_id,
+                            command="set_model",
+                            provider=self._provider_name,
+                        )
+                        break
 
                 await self._write_rpc(
                     process,
@@ -386,8 +400,18 @@ class GjcLLMAdapter(CodexCliLLMAdapter):
 
                 prompt_acked = False
                 while True:
-                    event = await next_event()
-                    self._check_unsupported_or_unknown(event)
+                    frame = await next_event()
+                    event = unwrap_event_envelope(frame, provider=self._provider_name)
+                    if event is None:
+                        event = frame
+                        self._check_unsupported_or_unknown(event)
+                    elif event.get("type") not in SUPPORTED_EVENT_TYPES:
+                        error = unsupported_enveloped_frame_error(
+                            event, provider=self._provider_name
+                        )
+                        if error is not None:
+                            raise error
+                        continue
                     event_id = event.get("id")
                     if event.get("type") == "response" and event_id == prompt_id:
                         validate_response_ack(
