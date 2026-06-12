@@ -44,6 +44,40 @@ def test_cli_auto_runtime_enum_matches_supported_backends() -> None:
     }
 
 
+def test_cli_runtime_enums_keep_inert_gjc_out_of_frontdoor_commands() -> None:
+    from ouroboros.cli.commands import init, mcp, run
+    from ouroboros.cli.commands.auto import AgentRuntimeBackend as AutoRuntimeBackend
+
+    with pytest.raises(ValueError):
+        AutoRuntimeBackend("gjc")
+    with pytest.raises(ValueError):
+        run.AgentRuntimeBackend("gjc")
+    with pytest.raises(ValueError):
+        mcp.AgentRuntimeBackend("gjc")
+    with pytest.raises(ValueError):
+        init.AgentRuntimeBackend("gjc")
+    with pytest.raises(ValueError):
+        mcp.LLMBackend("gjc")
+    with pytest.raises(ValueError):
+        init.LLMBackend("gjc")
+
+
+def test_cli_frontdoor_help_omits_inert_gjc_backend_options() -> None:
+    runner = CliRunner()
+    commands = [
+        ["auto", "--help"],
+        ["run", "workflow", "--help"],
+        ["mcp", "serve", "--help"],
+        ["mcp", "info", "--help"],
+        ["init", "start", "--help"],
+    ]
+
+    for args in commands:
+        result = runner.invoke(app, args)
+        assert result.exit_code == 0, result.output
+        assert "gjc" not in result.output
+
+
 def test_interview_allowed_tools_omits_unsupported_hermes_envelope(monkeypatch) -> None:
     assert _interview_allowed_tools("hermes") is None
     assert _interview_allowed_tools("codex")
