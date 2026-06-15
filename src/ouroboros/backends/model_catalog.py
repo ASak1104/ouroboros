@@ -99,9 +99,15 @@ def _build_catalogs() -> dict[str, BackendModelCatalog]:
             models=models,
             list_args=_LIST_ARGS.get(name),
         )
-    # LLM-only backend: model ids are provider-prefixed free-form strings,
-    # so the catalog is custom-entry-only.
+    # LLM-only backends: litellm model ids are provider/backend-owned
+    # free-form strings, so the catalog is custom-entry-only. ourocode ACP maps
+    # known backend selectors only; keep its catalog explicit so settings
+    # surfaces do not imply arbitrary model-id support.
     catalogs["litellm"] = BackendModelCatalog(backend="litellm", models=())
+    catalogs["ourocode"] = BackendModelCatalog(
+        backend="ourocode",
+        models=("claude", "claude_api", "codex", "gemini"),
+    )
     return catalogs
 
 
@@ -177,6 +183,7 @@ _CLI_PATH_GETTERS: dict[str, str] = {
     "goose": "get_goose_cli_path",
     "pi": "get_pi_cli_path",
     "gjc": "get_gjc_cli_path",
+    "ourocode": "get_ourocode_cli_path",
 }
 
 
