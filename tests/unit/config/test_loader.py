@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 import yaml
 
+from ouroboros.config._model_defaults import DEFAULT_OPUS_MODEL, DEFAULT_SONNET_MODEL
 from ouroboros.config.loader import (
     config_exists,
     create_default_config,
@@ -1366,7 +1367,24 @@ class TestLLMHelperLookups:
             assert get_semantic_model(backend="codex") == "gpt-5"
             assert get_assertion_extraction_model(backend="codex") == "gpt-5-nano"
 
-    @pytest.mark.parametrize("backend", ["codex", "copilot", "hermes", "kiro"])
+    @pytest.mark.parametrize("backend", ["codex", "copilot", "gjc", "hermes", "kiro", "pi"])
+    def test_sentinel_backend_preserves_explicit_opus_for_sonnet_default_fields(
+        self, backend: str
+    ) -> None:
+        """Only dependency/ontology treat pre-flip Opus as a shipped default."""
+        explicit_opus_config = OuroborosConfig(
+            llm=LLMConfig(qa_model=DEFAULT_OPUS_MODEL),
+            evaluation=EvaluationConfig(assertion_extraction_model=DEFAULT_OPUS_MODEL),
+        )
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.load_config", return_value=explicit_opus_config),
+        ):
+            assert get_qa_model(backend=backend) == DEFAULT_OPUS_MODEL
+            assert get_assertion_extraction_model(backend=backend) == DEFAULT_OPUS_MODEL
+
+    @pytest.mark.parametrize("backend", ["codex", "copilot", "gjc", "hermes", "kiro", "pi"])
     def test_legacy_shipped_default_models_still_normalize_to_sentinel(self, backend: str) -> None:
         """Regression for #1324 (ouroboros-agent[bot] req_1780385373_60).
 
@@ -1488,6 +1506,43 @@ class TestLLMHelperLookups:
             ),
         ):
             assert get_dependency_analysis_model() == "gpt-5-coder"
+
+    def test_dependency_and_ontology_getters_default_to_sonnet_not_opus(self) -> None:
+        """The runtime getters — not just the Pydantic field default — must
+        resolve to Sonnet for the flipped meta-tasks, including the
+        config-absent (ConfigError) path that CI / fresh installs hit."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                side_effect=ConfigError("no config"),
+            ),
+        ):
+            assert get_dependency_analysis_model() == DEFAULT_SONNET_MODEL
+            assert get_ontology_analysis_model() == DEFAULT_SONNET_MODEL
+            assert get_dependency_analysis_model() != DEFAULT_OPUS_MODEL
+
+    @pytest.mark.parametrize("backend", ["copilot", "gjc", "pi"])
+    def test_dependency_pre_flip_opus_value_still_normalizes_for_non_claude(
+        self, backend: str
+    ) -> None:
+        """A config persisted before the Opus→Sonnet flip holds an Opus literal
+        for these two fields; a Claude-incapable backend must still normalize it
+        to the "default" sentinel rather than leak an unrunnable Claude id."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=OuroborosConfig(
+                    llm=LLMConfig(
+                        dependency_analysis_model=DEFAULT_OPUS_MODEL,
+                        ontology_analysis_model="claude-opus-4-6",
+                    ),
+                ),
+            ),
+        ):
+            assert get_dependency_analysis_model(backend=backend) == "default"
+            assert get_ontology_analysis_model(backend=backend) == "default"
 
     def test_get_semantic_model_prefers_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Environment variable overrides config for semantic evaluation model."""
